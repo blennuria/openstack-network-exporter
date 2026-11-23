@@ -8,9 +8,12 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/openstack-k8s-operators/openstack-network-exporter/config"
 	"github.com/openstack-k8s-operators/openstack-network-exporter/log"
@@ -25,6 +28,11 @@ var (
 	sbLock  sync.Mutex
 	sbConn  client.Client
 	sbModel model.DatabaseModel
+	// The endpoint sbConn is connected to.
+	sbEndpoint string
+	// The endpoints of sbOrderRemote in the order they are tried.
+	sbOrderRemote string
+	sbOrder       []string
 )
 
 func discoverSBEndpoint(ctx context.Context) (string, error) {
@@ -56,42 +64,58 @@ func loadTLSConfig() (*tls.Config, error) {
 	}, nil
 }
 
-func sbConnect(ctx context.Context) (client.Client, error) {
-	sbLock.Lock()
-	defer sbLock.Unlock()
-
-	if sbConn != nil {
-		return sbConn, nil
-	}
-
-	endpoint := config.OvnSBConnection()
-	if endpoint == "" {
-		var err error
-		endpoint, err = discoverSBEndpoint(ctx)
-		if err != nil {
-			return nil, err
+// ovn-remote lists the members of a clustered database separated by commas.
+func sbEndpoints(remote string) []string {
+	var endpoints []string
+	for _, e := range strings.Split(remote, ",") {
+		e = strings.TrimSpace(e)
+		// "cid:<uuid>" is the cluster ID, not an endpoint.
+		if e != "" && !strings.HasPrefix(e, "cid:") {
+			endpoints = append(endpoints, e)
 		}
+	}
+	return endpoints
+}
+
+// The members are tried in a random order, as OVN clients do, so that the
+// exporters do not all query the same one. Tests replace it.
+var sbShuffle = func(endpoints []string) {
+	rand.Shuffle(len(endpoints), func(i, j int) {
+		endpoints[i], endpoints[j] = endpoints[j], endpoints[i]
+	})
+}
+
+// sbOrderOf returns the endpoints of remote in the order to try them. As OVN
+// clients do, they are shuffled once and keep that order, except that the
+// ones that fail go to the back. Call it with sbLock held.
+func sbOrderOf(remote string) []string {
+	if remote != sbOrderRemote {
+		sbOrderRemote = remote
+		sbOrder = sbEndpoints(remote)
+		sbShuffle(sbOrder)
+	}
+	return slices.Clone(sbOrder)
+}
+
+// sbMoveLast makes endpoint the last one to try. Call it with sbLock held.
+func sbMoveLast(endpoint string) {
+	if i := slices.Index(sbOrder, endpoint); i >= 0 {
+		sbOrder = append(slices.Delete(sbOrder, i, i+1), endpoint)
+	}
+}
+
+// An endpoint that does not answer must leave time for the next ones: it
+// only gets its share of what ctx has left for the untried endpoints.
+func sbConnectEndpoint(ctx context.Context, schema model.ClientDBModel, opts []client.Option, endpoint string, untried int) (client.Client, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Until(deadline)/time.Duration(untried))
+		defer cancel()
 	}
 
 	log.Debugf("connecting to OVN SB DB: %s", endpoint)
 
-	schema, err := ovnsb.FullDatabaseModel()
-	if err != nil {
-		return nil, fmt.Errorf("OVN SB FullDatabaseModel: %w", err)
-	}
-	mod, errs := model.NewDatabaseModel(ovnsb.Schema(), schema)
-	if len(errs) > 0 {
-		for _, e := range errs {
-			log.Errf("OVN SB model: %s", e)
-		}
-		return nil, errs[len(errs)-1]
-	}
-
-	opts := []client.Option{
-		client.WithEndpoint(endpoint),
-		client.WithLogger(log.OvsdbLogger()),
-	}
-
+	opts = append(slices.Clip(opts), client.WithEndpoint(endpoint))
 	if strings.HasPrefix(endpoint, "ssl:") {
 		tlsCfg, err := loadTLSConfig()
 		if err != nil {
@@ -106,6 +130,70 @@ func sbConnect(ctx context.Context) (client.Client, error) {
 	}
 	if err = db.Connect(ctx); err != nil {
 		return nil, fmt.Errorf("SB db.Connect: %w", err)
+	}
+
+	return db, nil
+}
+
+func sbConnect(ctx context.Context) (client.Client, error) {
+	sbLock.Lock()
+	defer sbLock.Unlock()
+
+	if sbConn != nil {
+		return sbConn, nil
+	}
+	// The time may have run out while waiting for the lock: do not blame the
+	// endpoints for it.
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("connecting to the OVN SB DB: %w", err)
+	}
+
+	remote := config.OvnSBConnection()
+	if remote == "" {
+		var err error
+		remote, err = discoverSBEndpoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	endpoints := sbOrderOf(remote)
+	if len(endpoints) == 0 {
+		return nil, fmt.Errorf("no endpoint in OVN SB remote %q", remote)
+	}
+
+	schema, err := ovnsb.FullDatabaseModel()
+	if err != nil {
+		return nil, fmt.Errorf("OVN SB FullDatabaseModel: %w", err)
+	}
+	mod, errs := model.NewDatabaseModel(ovnsb.Schema(), schema)
+	if len(errs) > 0 {
+		for _, e := range errs {
+			log.Errf("OVN SB model: %s", e)
+		}
+		return nil, errs[len(errs)-1]
+	}
+
+	opts := []client.Option{
+		client.WithLogger(log.OvsdbLogger()),
+	}
+
+	var db client.Client
+	for i, endpoint := range endpoints {
+		db, err = sbConnectEndpoint(ctx, schema, opts, endpoint, len(endpoints)-i)
+		if err == nil {
+			sbEndpoint = endpoint
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		sbMoveLast(endpoint)
+		if i < len(endpoints)-1 {
+			log.Warningf("%s, trying the next OVN SB endpoint", err)
+		}
+	}
+	if err != nil {
+		return nil, err
 	}
 
 	sbModel = mod
@@ -129,6 +217,8 @@ func sbForget(db client.Client) {
 	log.Warningf("lost connection to the OVN SB DB, reconnecting on the next call")
 	db.Close()
 	sbConn = nil
+	// The next connection tries the other members of the cluster first.
+	sbMoveLast(sbEndpoint)
 }
 
 func SBList[T model.Model](ctx context.Context, results *[]T) error {

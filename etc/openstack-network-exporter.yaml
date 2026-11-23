@@ -110,7 +110,11 @@
 #  - counters
 
 # Connection string for the OVN Southbound DB. If empty, auto-discovered
-# from the ovn-remote key in Open_vSwitch external_ids.
+# from the ovn-remote key in Open_vSwitch external_ids. Like ovn-remote, it
+# may list the members of a clustered database separated by commas, e.g.
+# "tcp:10.0.0.1:6642,tcp:10.0.0.2:6642,tcp:10.0.0.3:6642". They are tried in a
+# random order and the first one that answers is used. A member that fails is
+# tried last the next time.
 #
 # Env: OPENSTACK_NETWORK_EXPORTER_OVN_SB_CONNECTION
 # Default: "" (auto-discover)
