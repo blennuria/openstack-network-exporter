@@ -76,6 +76,43 @@ func getPidFromCtlFiles(rundir string, daemon appctlDaemon) (int, error) {
 	return 0, fmt.Errorf("could not extract PID from control socket files for %s", daemon)
 }
 
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func pidCtlSocket(rundir string, daemon appctlDaemon) (string, error) {
+	pidfile := filepath.Join(rundir, fmt.Sprintf("%s.pid", daemon))
+
+	// First try to get PID from .pid file
+	pid, err := getPidFromFile(pidfile)
+	if err != nil {
+		log.Debugf("Failed to read PID file %s: %s, trying to find PID from .ctl files", pidfile, err)
+		// If that fails, try to extract PID from .ctl files
+		pid, err = getPidFromCtlFiles(rundir, daemon)
+		if err != nil {
+			return "", err
+		}
+	}
+
+	return filepath.Join(rundir, fmt.Sprintf("%s.%d.ctl", daemon, pid)), nil
+}
+
+// A daemon started with --unixctl=<rundir>/<daemon>.ctl has no PID in its
+// socket name: that socket is used when the PID based one does not exist.
+func findCtlSocket(rundir string, daemon appctlDaemon) (string, error) {
+	sockpath, err := pidCtlSocket(rundir, daemon)
+	if err != nil || !fileExists(sockpath) {
+		fixed := filepath.Join(rundir, fmt.Sprintf("%s.ctl", daemon))
+		if fileExists(fixed) {
+			log.Debugf("No PID based control socket for %s, using %s", daemon, fixed)
+			return fixed, nil
+		}
+	}
+
+	return sockpath, err
+}
+
 func prepareCallDbServer(method string, rundir string, args ...string) (string, []string, error) {
 
 	const (
@@ -132,21 +169,11 @@ func call(daemon appctlDaemon, method string, args ...string) string {
 			return ""
 		}
 	} else {
-		pidfile := filepath.Join(rundir, fmt.Sprintf("%s.pid", daemon))
-
-		// First try to get PID from .pid file
-		pid, err := getPidFromFile(pidfile)
+		sockpath, err = findCtlSocket(rundir, daemon)
 		if err != nil {
-			log.Debugf("Failed to read PID file %s: %s, trying to find PID from .ctl files", pidfile, err)
-			// If that fails, try to extract PID from .ctl files
-			pid, err = getPidFromCtlFiles(rundir, daemon)
-			if err != nil {
-				log.Errf("Failed to get PID for %s: %s", daemon, err)
-				return ""
-			}
+			log.Errf("Failed to get PID for %s: %s", daemon, err)
+			return ""
 		}
-
-		sockpath = filepath.Join(rundir, fmt.Sprintf("%s.%d.ctl", daemon, pid))
 	}
 
 	conn, err := net.Dial("unix", sockpath)

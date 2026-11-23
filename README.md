@@ -67,6 +67,10 @@ The collector for OVN will need access to the `ovn-controller` unixctl socket. T
 socket path is resolved using the PID file of `ovn-controller` at
 `/run/ovn/ovn-controller.pid` => `/run/ovn/ovn-controller.$PID.ctl`.
 
+A daemon started with `--unixctl=$RUNDIR/$DAEMON.ctl` has no PID in the name of
+its unixctl socket: `$DAEMON.ctl` is used when `$DAEMON.$PID.ctl` does not
+exist.
+
 The bridge collector will need access to each bridge OpenFlow management socket
 located at `/run/openvswitch/$BRIDGE_NAME.mgmt`.
 
