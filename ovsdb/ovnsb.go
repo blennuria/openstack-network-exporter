@@ -30,10 +30,18 @@ var (
 	sbModel model.DatabaseModel
 	// The endpoint sbConn is connected to.
 	sbEndpoint string
+	// Closed when sbConn is forgotten.
+	sbGone chan struct{}
+	// Set while an echo checks that sbConn still answers.
+	sbProbing bool
 	// The endpoints of sbOrderRemote in the order they are tried.
 	sbOrderRemote string
 	sbOrder       []string
 )
+
+// How long a server that let a call time out has to answer an echo before
+// its client is forgotten. Tests change it.
+var sbProbeTimeout = 5 * time.Second
 
 func discoverSBEndpoint(ctx context.Context) (string, error) {
 	var vswitch ovsmodel.OpenvSwitch
@@ -198,27 +206,71 @@ func sbConnect(ctx context.Context) (client.Client, error) {
 
 	sbModel = mod
 	sbConn = db
-	go sbForgetOnDisconnect(db)
+	sbGone = make(chan struct{})
+	sbProbing = false
+	go sbForgetOnDisconnect(db, sbGone)
 	return db, nil
 }
 
-// libovsdb keeps Connected() true after server-side disconnect.
-func sbForgetOnDisconnect(db client.Client) {
-	<-db.DisconnectNotify()
-	sbForget(db)
+// libovsdb keeps Connected() true after server-side disconnect. It drops the
+// disconnect notification when nobody waits for it yet: stop waiting once the
+// client is forgotten otherwise, or the goroutine would never end.
+func sbForgetOnDisconnect(db client.Client, gone <-chan struct{}) {
+	select {
+	case <-db.DisconnectNotify():
+		sbForget(db, "lost connection to the OVN SB DB")
+	case <-gone:
+	}
 }
 
-func sbForget(db client.Client) {
+func sbForget(db client.Client, reason string) {
 	sbLock.Lock()
-	defer sbLock.Unlock()
 	if sbConn != db {
+		sbLock.Unlock()
 		return
 	}
-	log.Warningf("lost connection to the OVN SB DB, reconnecting on the next call")
-	db.Close()
 	sbConn = nil
+	close(sbGone)
 	// The next connection tries the other members of the cluster first.
 	sbMoveLast(sbEndpoint)
+	sbLock.Unlock()
+
+	log.Warningf("%s, reconnecting on the next call", reason)
+	// Close waits for the calls in progress on db, which may be stuck on a
+	// server that does not answer: the other callers need not wait for them.
+	db.Close()
+}
+
+// A server whose host goes down closes nothing: the calls time out until the
+// kernel gives up on the connection, about 15 minutes later. But a call also
+// times out when the caller has little time left or the server is slow: the
+// client is only forgotten if it does not answer an echo either.
+func sbProbe(db client.Client) {
+	sbLock.Lock()
+	defer sbLock.Unlock()
+	if sbConn != db || sbProbing {
+		return
+	}
+	sbProbing = true
+	timeout := sbProbeTimeout
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		if err := db.Echo(ctx); err != nil {
+			if ctx.Err() != nil {
+				// libovsdb reports a timeout as an incorrect response.
+				err = fmt.Errorf("no answer within %s", timeout)
+			}
+			sbForget(db, fmt.Sprintf("OVN SB DB echo: %s", err))
+			return
+		}
+		sbLock.Lock()
+		defer sbLock.Unlock()
+		if sbConn == db {
+			sbProbing = false
+		}
+	}()
 }
 
 func SBList[T model.Model](ctx context.Context, results *[]T) error {
@@ -238,9 +290,12 @@ func SBList[T model.Model](ctx context.Context, results *[]T) error {
 		Table: info.Metadata.TableName,
 	})
 	if err != nil {
-		if errors.Is(err, client.ErrNotConnected) {
+		switch {
+		case errors.Is(err, client.ErrNotConnected):
 			// Disconnect notification can be missed; drop the dead client here too.
-			sbForget(db)
+			sbForget(db, "lost connection to the OVN SB DB")
+		case errors.Is(err, context.DeadlineExceeded):
+			sbProbe(db)
 		}
 		return fmt.Errorf("SB Transact: %w", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,10 +60,40 @@ func startSBServer(t *testing.T, network, address string) *server.OvsdbServer {
 // client connection and removes the socket file, as a restart of the
 // database does. The in-memory server cannot be used for that: its Close()
 // only closes the listener and keeps accepted connections open.
+//
+// A silent proxy keeps its connections open and drops what the clients send,
+// as the network does when the host of the database goes down. A slow proxy
+// delays what the database sends.
 type socketProxy struct {
 	listener net.Listener
 	mu       sync.Mutex
 	conns    []net.Conn
+	silent   atomic.Bool
+	delay    atomic.Int64 // time.Duration
+}
+
+type clientConn struct {
+	net.Conn
+	proxy *socketProxy
+}
+
+func (c clientConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if c.proxy.silent.Load() {
+		n = 0
+	}
+	return n, err
+}
+
+type serverConn struct {
+	net.Conn
+	proxy *socketProxy
+}
+
+func (c serverConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	time.Sleep(time.Duration(c.proxy.delay.Load()))
+	return n, err
 }
 
 func startProxy(t *testing.T, path, backend string) *socketProxy {
@@ -86,8 +117,8 @@ func startProxy(t *testing.T, path, backend string) *socketProxy {
 			p.mu.Lock()
 			p.conns = append(p.conns, front, back)
 			p.mu.Unlock()
-			go func() { _, _ = io.Copy(back, front); back.Close() }()
-			go func() { _, _ = io.Copy(front, back); front.Close() }()
+			go func() { _, _ = io.Copy(back, clientConn{front, p}); back.Close() }()
+			go func() { _, _ = io.Copy(front, serverConn{back, p}); front.Close() }()
 		}
 	}()
 	return p
@@ -140,6 +171,137 @@ func TestSBReconnectAfterServerRestart(t *testing.T) {
 	waitFor(t, 5*time.Second, "calls to succeed after the SB database is back", func() bool { return listDatapaths() == nil })
 }
 
+// A cluster member that goes down without closing its connections does not
+// answer anymore. The client connected to it must not be kept: the next call
+// has to reach another member.
+func TestSBReconnectAfterServerSilence(t *testing.T) {
+	dir := t.TempDir()
+	backend := filepath.Join(dir, "backend.sock")
+	srv := startSBServer(t, "unix", backend)
+	defer srv.Close()
+
+	sock := filepath.Join(dir, "sb.sock")
+	proxy := startProxy(t, sock, backend)
+	defer proxy.stop()
+
+	useSBRemote(t, "unix:"+sock+",unix:"+backend)
+	setSBProbeTimeout(t, 100*time.Millisecond)
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	proxy.silent.Store(true)
+	if err := listDatapaths(); err == nil {
+		t.Fatal("a silent SB database answered")
+	}
+	waitFor(t, 2*time.Second, "the client of the silent SB database to be dropped", func() bool {
+		return sbConnected() == ""
+	})
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("call after the SB database went silent: %v", err)
+	}
+	if got, want := sbConnected(), "unix:"+backend; got != want {
+		t.Fatalf("connected to %s, want %s", got, want)
+	}
+}
+
+// Closing the client of a silent SB database waits for the calls that are
+// still in progress on it. The other callers must not wait with them to
+// reach another member.
+func TestSBReconnectDuringStuckCall(t *testing.T) {
+	dir := t.TempDir()
+	backend := filepath.Join(dir, "backend.sock")
+	srv := startSBServer(t, "unix", backend)
+	defer srv.Close()
+
+	sock := filepath.Join(dir, "sb.sock")
+	proxy := startProxy(t, sock, backend)
+	defer proxy.stop()
+
+	useSBRemote(t, "unix:"+sock+",unix:"+backend)
+	setSBProbeTimeout(t, 100*time.Millisecond)
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+
+	proxy.silent.Store(true)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stuck := make(chan error, 1)
+	go func() {
+		var datapaths []ovnsb.DatapathBinding
+		stuck <- SBList(ctx, &datapaths)
+	}()
+	if err := listDatapathsWithin(200 * time.Millisecond); err == nil {
+		t.Fatal("a silent SB database answered")
+	}
+	waitFor(t, 2*time.Second, "the client of the silent SB database to be dropped", func() bool {
+		return sbConnected() == ""
+	})
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("call while another one is stuck: %v", err)
+	}
+	select {
+	case err := <-stuck:
+		t.Fatalf("the call had to wait for the stuck one, which ended with: %v", err)
+	default:
+	}
+
+	cancel()
+	<-stuck
+}
+
+// A call also times out when the caller has little time left or the server
+// is slow. The client of a server that still answers must be kept.
+func TestSBKeepSlowServer(t *testing.T) {
+	dir := t.TempDir()
+	backend := filepath.Join(dir, "backend.sock")
+	srv := startSBServer(t, "unix", backend)
+	defer srv.Close()
+
+	sock := filepath.Join(dir, "sb.sock")
+	proxy := startProxy(t, sock, backend)
+	defer proxy.stop()
+
+	useSBRemote(t, "unix:"+sock)
+	setSBProbeTimeout(t, 2*time.Second)
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	sbLock.Lock()
+	db := sbConn
+	sbLock.Unlock()
+
+	proxy.delay.Store(int64(200 * time.Millisecond))
+	if err := listDatapathsWithin(50 * time.Millisecond); err == nil {
+		t.Fatal("a slow SB database answered in time")
+	}
+	waitFor(t, 5*time.Second, "the echo to the slow SB database", func() bool {
+		sbLock.Lock()
+		defer sbLock.Unlock()
+		return !sbProbing || sbConn != db
+	})
+	sbLock.Lock()
+	kept := sbConn == db
+	sbLock.Unlock()
+	if !kept {
+		t.Fatal("the client of a slow SB database was dropped")
+	}
+
+	proxy.delay.Store(0)
+	if err := listDatapaths(); err != nil {
+		t.Fatalf("call to the SB database once fast again: %v", err)
+	}
+}
+
+// setSBProbeTimeout sets how long the SB database has to answer an echo.
+func setSBProbeTimeout(t *testing.T, timeout time.Duration) {
+	t.Helper()
+	old := sbProbeTimeout
+	sbProbeTimeout = timeout
+	t.Cleanup(func() { sbProbeTimeout = old })
+}
+
 // useSBRemote points a disconnected SB client to remote and makes it try the
 // endpoints in the order they are listed.
 func useSBRemote(t *testing.T, remote string) {
@@ -148,6 +310,7 @@ func useSBRemote(t *testing.T, remote string) {
 		sbLock.Lock()
 		defer sbLock.Unlock()
 		if sbConn != nil {
+			close(sbGone)
 			sbConn.Close()
 			sbConn = nil
 		}
@@ -286,7 +449,7 @@ func TestSBRemoteOrder(t *testing.T) {
 	sbLock.Lock()
 	db := sbConn
 	sbLock.Unlock()
-	sbForget(db)
+	sbForget(db, "test")
 	if err := listDatapaths(); err != nil {
 		t.Fatalf("call after the client was dropped: %v", err)
 	}
